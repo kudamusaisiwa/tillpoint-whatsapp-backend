@@ -141,6 +141,49 @@ app.get('/session/status/:sessionId', checkApiKey, async (req, res) => {
     }
 });
 
+// API: Logout and force new QR code
+app.post('/session/logout/:sessionId', checkApiKey, async (req, res) => {
+    try {
+        console.log('Logging out and destroying session...');
+        await client.logout();
+        console.log('Logged out, reinitializing...');
+        // After logout, reinitialize to get a new QR code
+        setTimeout(() => {
+            client.initialize();
+        }, 2000);
+        res.json({ success: true, message: 'Logged out. New QR code will be generated.' });
+    } catch (error) {
+        console.error('Logout error:', error);
+        // Even if logout fails, try to reinitialize
+        try {
+            await client.destroy();
+            setTimeout(() => {
+                client.initialize();
+            }, 2000);
+            res.json({ success: true, message: 'Session destroyed. New QR code will be generated.' });
+        } catch (e) {
+            res.status(500).json({ success: false, error: error.toString() });
+        }
+    }
+});
+
+// API: Force restart (destroy and reinitialize)
+app.post('/session/restart/:sessionId', checkApiKey, async (req, res) => {
+    try {
+        console.log('Force restarting WhatsApp client...');
+        await client.destroy();
+        console.log('Client destroyed, waiting before reinitialize...');
+        setTimeout(() => {
+            console.log('Reinitializing client...');
+            client.initialize();
+        }, 3000);
+        res.json({ success: true, message: 'Client restarting. New QR code will appear in logs.' });
+    } catch (error) {
+        console.error('Restart error:', error);
+        res.status(500).json({ success: false, error: error.toString() });
+    }
+});
+
 // API: Health Check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
