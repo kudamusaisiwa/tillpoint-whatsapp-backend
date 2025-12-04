@@ -107,11 +107,22 @@ app.post('/client/sendMessage/:sessionId', checkApiKey, async (req, res) => {
     }
 
     try {
+        // Check if client is ready
+        const state = await client.getState();
+        console.log('Client state:', state);
+
+        if (state !== 'CONNECTED') {
+            return res.status(503).json({
+                success: false,
+                error: `WhatsApp client not ready. Current state: ${state || 'INITIALIZING'}`
+            });
+        }
+
         // Direct send - this is the robust method that handles new chats automatically
-        // We do NOT fetch the chat object first to avoid "sendSeen" errors on new chats
+        console.log(`Attempting to send message to ${chatId}...`);
         const response = await client.sendMessage(chatId, content);
 
-        console.log(`Message sent to ${chatId}`);
+        console.log(`Message sent to ${chatId}`, response.id);
         res.json({ success: true, id: response.id });
 
     } catch (error) {
