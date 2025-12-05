@@ -85,18 +85,9 @@ client.on('disconnected', (reason) => {
     sendWebhook('disconnected', reason);
 });
 
-// Event: Message received
-client.on('message', async msg => {
-    console.log('MESSAGE RECEIVED', msg.body);
-    sendWebhook('message', {
-        from: msg.from,
-        to: msg.to,
-        body: msg.body,
-        type: msg.type,
-        timestamp: msg.timestamp,
-        id: msg.id
-    });
-});
+// NOTE: Incoming messages are intentionally NOT handled
+// This system is send-only for notifications - we don't need to receive/process messages
+// This prevents flooding and resource spikes on Render
 
 // API: Send Message
 app.post('/client/sendMessage/:sessionId', checkApiKey, async (req, res) => {
