@@ -1,6 +1,7 @@
 const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const cors = require('cors');
 const axios = require('axios');
 
@@ -56,10 +57,27 @@ const sendWebhook = async (event, data) => {
 };
 
 // Event: QR Code generated
-client.on('qr', (qr) => {
-    console.log('QR RECEIVED', qr);
-    qrcode.generate(qr, { small: true });
-    sendWebhook('qr', qr);
+client.on('qr', async (qr) => {
+    console.log('QR RECEIVED');
+    qrcodeTerminal.generate(qr, { small: true });
+
+    // Generate base64 data URI for the QR code
+    try {
+        const qrDataUri = await QRCode.toDataURL(qr, {
+            width: 300,
+            margin: 2,
+            color: {
+                dark: '#000000',
+                light: '#FFFFFF'
+            }
+        });
+        console.log('QR code base64 generated, sending to webhook...');
+        sendWebhook('qr', { qrString: qr, qrDataUri });
+    } catch (err) {
+        console.error('Failed to generate QR code image:', err);
+        // Fallback: send raw QR string
+        sendWebhook('qr', qr);
+    }
 });
 
 // Event: Client ready
