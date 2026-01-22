@@ -128,8 +128,9 @@ app.post('/client/sendMessage/:sessionId', checkApiKey, async (req, res) => {
         }
 
         // Direct send - this is the robust method that handles new chats automatically
+        // Using sendSeen: false to avoid the markedUnread bug in whatsapp-web.js
         console.log(`Attempting to send message to ${chatId}...`);
-        const response = await client.sendMessage(chatId, content);
+        const response = await client.sendMessage(chatId, content, { sendSeen: false });
 
         console.log(`Message sent to ${chatId}`, response.id);
         res.json({ success: true, id: response.id });
