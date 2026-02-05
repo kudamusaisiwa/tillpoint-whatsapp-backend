@@ -1,7 +1,5 @@
 const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcodeTerminal = require('qrcode-terminal');
-const QRCode = require('qrcode');
 const cors = require('cors');
 const axios = require('axios');
 
@@ -18,7 +16,7 @@ if (!API_KEY) {
 }
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50kb' }));
 
 // Middleware to check API Key
 const checkApiKey = (req, res, next) => {
@@ -31,10 +29,41 @@ const checkApiKey = (req, res, next) => {
 
 // Initialize WhatsApp Client
 // Using LocalAuth for session persistence (note: on Render ephemeral instances, session is lost on restart unless a Disk is attached)
+const SESSION_ID = 'tillpoint_main';
+let isInitializing = false;
+let isRestarting = false;
+let cachedState = 'INITIALIZING';
+
+const safeInitialize = (reason) => {
+    if (isInitializing) {
+        console.log('Initialize skipped (already initializing)');
+        return;
+    }
+    isInitializing = true;
+    cachedState = 'INITIALIZING';
+    console.log(`Initializing WhatsApp client${reason ? `: ${reason}` : ''}...`);
+    try {
+        client.initialize();
+    } catch (e) {
+        console.error('Client initialize threw error:', e?.message || String(e));
+        isInitializing = false;
+    }
+};
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--no-first-run',
+            '--disable-default-apps',
+            '--disable-features=site-per-process',
+            '--no-zygote',
+        ],
         headless: true
     }
 });
@@ -45,7 +74,7 @@ const sendWebhook = async (event, data) => {
     try {
         await axios.post(WEBHOOK_URL, {
             event,
-            session: 'tillpoint_main',
+            session: SESSION_ID,
             data
         }, {
             headers: { 'x-api-key': API_KEY }
@@ -59,47 +88,47 @@ const sendWebhook = async (event, data) => {
 // Event: QR Code generated
 client.on('qr', async (qr) => {
     console.log('QR RECEIVED');
-    qrcodeTerminal.generate(qr, { small: true });
 
-    // Generate base64 data URI for the QR code
-    try {
-        const qrDataUri = await QRCode.toDataURL(qr, {
-            width: 300,
-            margin: 2,
-            color: {
-                dark: '#000000',
-                light: '#FFFFFF'
-            }
-        });
-        console.log('QR code base64 generated, sending to webhook...');
-        sendWebhook('qr', { qrString: qr, qrDataUri });
-    } catch (err) {
-        console.error('Failed to generate QR code image:', err);
-        // Fallback: send raw QR string
-        sendWebhook('qr', qr);
+    cachedState = 'INITIALIZING';
+    isInitializing = false;
+
+    if (process.env.LOG_QR_TERMINAL === 'true') {
+        const qrcodeTerminal = require('qrcode-terminal');
+        qrcodeTerminal.generate(qr, { small: true });
     }
+
+    // Send raw QR string only (lower memory than generating base64 images)
+    sendWebhook('qr', qr);
 });
 
 // Event: Client ready
 client.on('ready', () => {
     console.log('Client is ready!');
-    sendWebhook('ready', { me: client.info });
+    cachedState = 'CONNECTED';
+    isInitializing = false;
+    const connectedUser = client?.info?.wid?.user || null;
+    sendWebhook('ready', { me: { user: connectedUser } });
 });
 
 // Event: Client authenticated
 client.on('authenticated', () => {
     console.log('Client authenticated');
+    isInitializing = false;
 });
 
 // Event: Auth failure
 client.on('auth_failure', msg => {
     console.error('AUTHENTICATION FAILURE', msg);
+    cachedState = 'DISCONNECTED';
+    isInitializing = false;
     sendWebhook('auth_failure', msg);
 });
 
 // Event: Disconnected
 client.on('disconnected', (reason) => {
     console.log('Client was disconnected', reason);
+    cachedState = 'DISCONNECTED';
+    isInitializing = false;
     sendWebhook('disconnected', reason);
 });
 
@@ -117,8 +146,11 @@ app.post('/client/sendMessage/:sessionId', checkApiKey, async (req, res) => {
 
     try {
         // Check if client is ready
-        const state = await client.getState();
-        console.log('Client state:', state);
+        let state = cachedState;
+        if (state !== 'CONNECTED') {
+            state = await client.getState();
+            cachedState = state || cachedState;
+        }
 
         if (state !== 'CONNECTED') {
             return res.status(503).json({
@@ -129,10 +161,11 @@ app.post('/client/sendMessage/:sessionId', checkApiKey, async (req, res) => {
 
         // Direct send - this is the robust method that handles new chats automatically
         // Using sendSeen: false to avoid the markedUnread bug in whatsapp-web.js
-        console.log(`Attempting to send message to ${chatId}...`);
+        const maskedChatId = typeof chatId === 'string' ? chatId.replace(/\d(?=\d{4})/g, '*') : 'unknown';
+        console.log(`Attempting to send message to ${maskedChatId}...`);
         const response = await client.sendMessage(chatId, content, { sendSeen: false });
 
-        console.log(`Message sent to ${chatId}`, response.id);
+        console.log('Message sent', response.id);
         res.json({ success: true, id: response.id });
 
     } catch (error) {
@@ -145,6 +178,7 @@ app.post('/client/sendMessage/:sessionId', checkApiKey, async (req, res) => {
 app.get('/session/status/:sessionId', checkApiKey, async (req, res) => {
     try {
         const state = await client.getState();
+        cachedState = state || cachedState;
         res.json({ success: true, state });
     } catch (error) {
         res.json({ success: false, error: error.toString() });
@@ -154,12 +188,17 @@ app.get('/session/status/:sessionId', checkApiKey, async (req, res) => {
 // API: Logout and force new QR code
 app.post('/session/logout/:sessionId', checkApiKey, async (req, res) => {
     try {
+        if (isRestarting) {
+            return res.status(202).json({ success: true, message: 'Restart already in progress.' });
+        }
+        isRestarting = true;
         console.log('Logging out and destroying session...');
         await client.logout();
         console.log('Logged out, reinitializing...');
         // After logout, reinitialize to get a new QR code
         setTimeout(() => {
-            client.initialize();
+            safeInitialize('logout');
+            isRestarting = false;
         }, 2000);
         res.json({ success: true, message: 'Logged out. New QR code will be generated.' });
     } catch (error) {
@@ -168,10 +207,12 @@ app.post('/session/logout/:sessionId', checkApiKey, async (req, res) => {
         try {
             await client.destroy();
             setTimeout(() => {
-                client.initialize();
+                safeInitialize('logout_destroy');
+                isRestarting = false;
             }, 2000);
             res.json({ success: true, message: 'Session destroyed. New QR code will be generated.' });
         } catch (e) {
+            isRestarting = false;
             res.status(500).json({ success: false, error: error.toString() });
         }
     }
@@ -180,16 +221,22 @@ app.post('/session/logout/:sessionId', checkApiKey, async (req, res) => {
 // API: Force restart (destroy and reinitialize)
 app.post('/session/restart/:sessionId', checkApiKey, async (req, res) => {
     try {
+        if (isRestarting) {
+            return res.status(202).json({ success: true, message: 'Restart already in progress.' });
+        }
+        isRestarting = true;
         console.log('Force restarting WhatsApp client...');
         await client.destroy();
         console.log('Client destroyed, waiting before reinitialize...');
         setTimeout(() => {
             console.log('Reinitializing client...');
-            client.initialize();
+            safeInitialize('restart');
+            isRestarting = false;
         }, 3000);
         res.json({ success: true, message: 'Client restarting. New QR code will appear in logs.' });
     } catch (error) {
         console.error('Restart error:', error);
+        isRestarting = false;
         res.status(500).json({ success: false, error: error.toString() });
     }
 });
@@ -200,8 +247,7 @@ app.get('/health', (req, res) => {
 });
 
 // Start Client
-console.log('Initializing WhatsApp client...');
-client.initialize();
+safeInitialize('startup');
 
 // Start Server
 app.listen(port, () => {
