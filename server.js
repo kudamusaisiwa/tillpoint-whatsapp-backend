@@ -33,6 +33,9 @@ const SESSION_ID = 'tillpoint_main';
 let isInitializing = false;
 let isRestarting = false;
 let cachedState = 'INITIALIZING';
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BASE_DELAY_MS = 5000;
 
 const safeInitialize = (reason) => {
     if (isInitializing) {
@@ -49,6 +52,48 @@ const safeInitialize = (reason) => {
         isInitializing = false;
     }
 };
+
+// Detect fatal Puppeteer errors that require a full client restart
+const isFatalClientError = (error) => {
+    const msg = error?.message || String(error);
+    return msg.includes('detached Frame') ||
+           msg.includes('Protocol error') ||
+           msg.includes('Session closed') ||
+           msg.includes('Target closed') ||
+           msg.includes('Navigation failed') ||
+           msg.includes('Execution context was destroyed');
+};
+
+// Auto-reconnect with exponential backoff
+const autoReconnect = async (reason) => {
+    if (isRestarting) {
+        console.log('Auto-reconnect skipped (restart already in progress)');
+        return;
+    }
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error(`Auto-reconnect giving up after ${MAX_RECONNECT_ATTEMPTS} attempts`);
+        cachedState = 'DISCONNECTED';
+        return;
+    }
+
+    isRestarting = true;
+    reconnectAttempts++;
+    cachedState = 'RECONNECTING';
+    const delay = RECONNECT_BASE_DELAY_MS * reconnectAttempts;
+    console.log(`Auto-reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms (reason: ${reason})`);
+
+    try {
+        await client.destroy();
+    } catch (e) {
+        console.error('Error destroying client during reconnect:', e?.message || String(e));
+    }
+
+    setTimeout(() => {
+        isRestarting = false;
+        safeInitialize(`auto-reconnect: ${reason}`);
+    }, delay);
+};
+
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
@@ -106,6 +151,7 @@ client.on('ready', () => {
     console.log('Client is ready!');
     cachedState = 'CONNECTED';
     isInitializing = false;
+    reconnectAttempts = 0; // Reset on successful connection
     const connectedUser = client?.info?.wid?.user || null;
     sendWebhook('ready', { me: { user: connectedUser } });
 });
@@ -124,12 +170,13 @@ client.on('auth_failure', msg => {
     sendWebhook('auth_failure', msg);
 });
 
-// Event: Disconnected
+// Event: Disconnected — auto-reconnect
 client.on('disconnected', (reason) => {
-    console.log('Client was disconnected', reason);
+    console.log('Client was disconnected:', reason);
     cachedState = 'DISCONNECTED';
     isInitializing = false;
     sendWebhook('disconnected', reason);
+    autoReconnect(reason || 'disconnected');
 });
 
 // NOTE: Incoming messages are intentionally NOT handled
@@ -170,6 +217,18 @@ app.post('/client/sendMessage/:sessionId', checkApiKey, async (req, res) => {
 
     } catch (error) {
         console.error('Error sending message:', error);
+
+        // Detect fatal Puppeteer errors and trigger auto-reconnect
+        if (isFatalClientError(error)) {
+            cachedState = 'DISCONNECTED';
+            autoReconnect(error?.message || 'fatal client error');
+            return res.status(503).json({
+                success: false,
+                error: 'WhatsApp client disconnected. Auto-reconnecting. Please retry shortly.',
+                retryable: true,
+            });
+        }
+
         res.status(500).json({ success: false, error: error.toString() });
     }
 });
